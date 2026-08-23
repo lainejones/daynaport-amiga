@@ -1,0 +1,67 @@
+; InstallDayna - non-interactive install of the patched scsidayna.device
+; (SANA-II DaynaPort driver) PLUS the Roadshow network configuration.
+;
+; Rewritten 2026-08-07 after the first A500 install: the old version only
+; copied the driver+prefs and left the TCP-stack side ("configure it
+; yourself") - which is exactly the part that made it "not really work".
+; This version writes everything the working A500 setup needed:
+;   DEVS:Networks/scsidayna.device
+;   ENVARC:scsidayna.prefs + ENV: copy   (AUTOCONNECT=1 + WiFi creds)
+;   DEVS:NetInterfaces/scsidayna         (static IP interface)
+;   DEVS:Internet/Routes                 (default gateway)
+;   DEVS:Internet/name_resolution        (DNS)
+; Existing config files are NOT overwritten (so re-running is safe on an
+; already-tuned machine) - it says "kept existing" instead.
+;
+; Defaults below = one example LAN (a static 192.168.50.36). Edit for your own.
+; For an interactive walkthrough use the full "Install" script instead.
+;
+; Run from the drawer containing scsidayna.device and scsidayna.prefs:
+;   Execute InstallDayna
+
+If NOT EXISTS DEVS:Networks
+  MakeDir DEVS:Networks
+EndIf
+Copy scsidayna.device DEVS:Networks/ CLONE QUIET
+Echo "Installed DEVS:Networks/scsidayna.device"
+
+If EXISTS ENVARC:scsidayna.prefs
+  Echo "kept existing ENVARC:scsidayna.prefs"
+Else
+  Copy scsidayna.prefs ENVARC:scsidayna.prefs CLONE QUIET
+  Echo "Installed ENVARC:scsidayna.prefs (check SSID/KEY inside!)"
+EndIf
+Copy ENVARC:scsidayna.prefs ENV:scsidayna.prefs CLONE QUIET
+
+If NOT EXISTS DEVS:NetInterfaces
+  MakeDir DEVS:NetInterfaces
+EndIf
+If EXISTS DEVS:NetInterfaces/scsidayna
+  Echo "kept existing DEVS:NetInterfaces/scsidayna"
+Else
+  Echo >DEVS:NetInterfaces/scsidayna "device=scsidayna.device"
+  Echo >>DEVS:NetInterfaces/scsidayna "address=192.168.50.36"
+  Echo >>DEVS:NetInterfaces/scsidayna "netmask=255.255.255.0"
+  Echo "Wrote DEVS:NetInterfaces/scsidayna (static 192.168.50.36)"
+EndIf
+
+If NOT EXISTS DEVS:Internet
+  MakeDir DEVS:Internet
+EndIf
+If EXISTS DEVS:Internet/Routes
+  Echo "kept existing DEVS:Internet/Routes"
+Else
+  Echo >DEVS:Internet/Routes "default 192.168.50.1"
+  Echo "Wrote DEVS:Internet/Routes (gateway 192.168.50.1)"
+EndIf
+If EXISTS DEVS:Internet/name_resolution
+  Echo "kept existing DEVS:Internet/name_resolution"
+Else
+  Echo >DEVS:Internet/name_resolution "nameserver 192.168.50.30"
+  Echo "Wrote DEVS:Internet/name_resolution (DNS 192.168.50.30)"
+EndIf
+
+Echo ""
+Echo "Done. Reboot (or start your stack) - Roadshow will bring up"
+Echo "scsidayna.device on 192.168.50.36. For troubleshooting set"
+Echo "DEBUG=1 in ENVARC:scsidayna.prefs and re-copy it to ENV:."

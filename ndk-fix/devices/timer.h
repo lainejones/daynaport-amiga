@@ -1,0 +1,31 @@
+#ifndef DEVICES_TIMER_H
+#define DEVICES_TIMER_H
+/* Classic C90 timer.h override for vbcc (bebbo NDK anonymous-union workaround) */
+#ifndef EXEC_IO_H
+#include <exec/io.h>
+#endif
+#define UNIT_MICROHZ    0
+#define UNIT_VBLANK     1
+#define UNIT_ECLOCK     2
+#define UNIT_WAITUNTIL  3
+#define UNIT_WAITECLOCK 4
+#define TIMERNAME "timer.device"
+struct timeval {
+    ULONG tv_secs;
+    ULONG tv_micro;
+};
+struct timerequest {
+    struct IORequest tr_node;
+    struct timeval   tr_time;
+};
+#define TR_ADDREQUEST (CMD_NONSTD+0)
+#define TR_GETSYSTIME (CMD_NONSTD+1)
+#define TR_SETSYSTIME (CMD_NONSTD+2)
+struct EClockVal {
+    ULONG ev_hi;
+    ULONG ev_lo;
+};
+typedef struct timeval     TimeVal_Type;
+typedef struct timerequest TimeRequest_Type;
+typedef struct EClockVal   EClockVal_Type;
+#endif

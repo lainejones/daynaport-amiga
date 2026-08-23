@@ -176,12 +176,15 @@ LONG tokeniseSetting(char* data, char** value) {
     return 0;
 }
 
-// Safe (I hope ;) implementation to prevent buffer overflows
+// Safe implementation to prevent buffer overflows: copies at most maxLength-1
+// characters and always NUL-terminates. (The old version dropped the last
+// character - it relied on a trailing newline - and underflowed on empty input,
+// copying 64KB when src was "".)
 void strcpy_s(char* dest, char* src, USHORT maxLength) {
     USHORT i = strlen(src);
-    if (i>=maxLength) i = maxLength;
-    memcpy(dest, src, i-1);
-    dest[i-1] = '\0';
+    if (i >= maxLength) i = maxLength - 1;
+    memcpy(dest, src, i);
+    dest[i] = '\0';
 }
 
 // Removes any trailing newline characters
@@ -225,29 +228,33 @@ LONG SCSIWifi_loadSettings(void *utilityBase, void* dosBase, struct ScsiDaynaSet
         USHORT matches = 0;
         while (FGets(fh, buffer, 128)) {
             char* value;
+            removeNL(buffer);
             if (tokeniseSetting(buffer, &value)) {
-                // find a match
+                // find a match - only count lines whose token we actually recognise
                 for (USHORT token = 0; token < NUM_TOKENS; token++) {
-                    matches++;
                     if (Stricmp(CONFIG_TOKENS[token], buffer) == 0) {
+                        matches++;
                         switch (token) {
                             case 0: strcpy_s(settings->deviceName, value, 108); break;
                             case 1: settings->deviceID = _atos(value); break;
-                            case 2: settings->taskPriority = _atos(value); 
+                            case 2: settings->taskPriority = _atos(value);
                                     if (settings->taskPriority>127) settings->taskPriority = 127;
                                     if (settings->taskPriority<-128) settings->taskPriority = -128;
                                     break;
-                            case 3: settings->scsiMode = _atous(value); 
+                            case 3: settings->scsiMode = _atous(value);
                                     if (settings->scsiMode>2) settings->scsiMode=2;
                                     modeConfigured = 1;
                                     break;
                             case 4: settings->autoConnect = _atous(value); break;
                             case 5: strcpy_s(settings->ssid, value, 64); break;
                             case 6: strcpy_s(settings->key, value, 64); break;
-							case 7: settings->maxDataSize = _atous(value); break;
+							case 7: settings->maxDataSize = _atous(value);
+									// 0 or a tiny value would underflow the batch buffer maths in
+									// the driver; never allow less than one full packet + headers
+									if (settings->maxDataSize < SCSIWIFI_PACKET_MAX_SIZE + 8) settings->maxDataSize = SCSIWIFI_PACKET_MAX_SIZE + 8;
+									break;
 							case 8: settings->debug = _atos(value) != 0; break;
 							case 9: settings->aggressive = _atos(value) != 0; break;
-                            default: matches--; break;
                         }
                         break;
                     }
@@ -256,12 +263,13 @@ LONG SCSIWifi_loadSettings(void *utilityBase, void* dosBase, struct ScsiDaynaSet
         }
         if (matches < 1) SCSIWifi_defaultSettings(settings);
         Close(fh);
-        return matches > 0;
-    }
 
-    // If no mode was set, but a GVP device was specified then jump to mode 2. It will default to 1 anyway
-    if (!modeConfigured) {
-        if ((ToUpper(settings->deviceName[0]) == 'G') && (ToUpper(settings->deviceName[0]) == 'V') && (ToUpper(settings->deviceName[0]) == 'P')) settings->scsiMode = 2;
+        // If no mode was set, but a GVP device was specified then jump to mode 2. It will default to 1 anyway
+        if ((matches > 0) && (!modeConfigured)) {
+            if ((ToUpper(settings->deviceName[0]) == 'G') && (ToUpper(settings->deviceName[1]) == 'V') && (ToUpper(settings->deviceName[2]) == 'P')) settings->scsiMode = 2;
+        }
+
+        return matches > 0;
     }
 
     return 0;
@@ -398,19 +406,28 @@ SCSIWIFIDevice SCSIWifi_open(struct SCSIDevice_OpenData* openData, enum SCSIWifi
         dev->sc_UtilityBase = openData->utilityBase;
         dev->sc_dosBase = openData->dosBase;
 
-        dev->Port = _CreatePort(dev, NULL, 0);        
+        dev->Port = _CreatePort(dev, NULL, 0);
         if (!dev->Port) {
             *errorCode = sworOutOfMem;
+            FreeVec(dev);
             return NULL;
         }
         dev->SCSIReq = (struct IOStdReq*)_CreateExtIO(dev, dev->Port, sizeof(struct IOStdReq));
-        if (!dev->SCSIReq) {            
+        if (!dev->SCSIReq) {
             *errorCode = sworOutOfMem;
             _SCSIWifi_close(dev);
             return NULL;
         }
         // Space for the command and a bit for the result
         dev->scsiCommand = AllocVec(32, MEMF_PUBLIC|MEMF_CLEAR);
+        if (!dev->scsiCommand) {
+            *errorCode = sworOutOfMem;
+            // The device isn't open yet so _SCSIWifi_close mustn't CloseDevice it
+            _DeleteExtIO(dev, (struct IORequest *)dev->SCSIReq);
+            dev->SCSIReq = NULL;
+            _SCSIWifi_close(dev);
+            return NULL;
+        }
 
         // Open driver
         BYTE err = OpenDevice(openData->deviceDriverName, openData->deviceID, (struct IORequest*)dev->SCSIReq, 0);
@@ -497,7 +514,7 @@ LONG SCSIWifi_scan(SCSIWIFIDevice device, enum SCSIWifi_ScanStatus* status) {
 
     SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_CMD, SCSI_NETWORK_WIFI_OPT_SCAN, 0, 0, 0, 0);    
 
-    dev->Cmd.scsi_Data = (APTR)&dev->scsiCommand;
+    dev->Cmd.scsi_Data = (APTR)&dev->scsiCommand[6];   // was &dev->scsiCommand - the result overwrote the pointer itself!
     dev->Cmd.scsi_Length = 4;                       // NEEDS to be 4
     dev->Cmd.scsi_Flags = SCSIF_READ | SCSIF_AUTOSENSE;
 

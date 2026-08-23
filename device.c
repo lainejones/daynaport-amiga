@@ -46,7 +46,7 @@
 #include "device.h"
 #include "macros.h"
 
-const UWORD dev_supportedcmds[] = { NSCMD_DEVICEQUERY, CMD_READ, CMD_WRITE, /*S2_SANA2HOOK, */S2_GETGLOBALSTATS, S2_BROADCAST, CMD_WRITE, S2_ONEVENT, S2_READORPHAN, S2_ONLINE, S2_OFFLINE, S2_GETSTATIONADDRESS, S2_DEVICEQUERY, S2_GETSPECIALSTATS, 0 };
+const UWORD dev_supportedcmds[] = { NSCMD_DEVICEQUERY, CMD_READ, CMD_WRITE, /*S2_SANA2HOOK, */S2_GETGLOBALSTATS, S2_BROADCAST, S2_ONEVENT, S2_READORPHAN, S2_ONLINE, S2_OFFLINE, S2_CONFIGINTERFACE, S2_GETSTATIONADDRESS, S2_DEVICEQUERY, S2_GETSPECIALSTATS, 0 };
 
 
 #include <proto/exec.h>
@@ -79,16 +79,32 @@ void freeInit(DEVBASEP) {
 }
 
 void DevTermIO( DEVBASEP, struct IORequest *ioreq );
+void DoEvent( DEVBASEP, long event );
+void rejectAllPackets( DEVBASEP );
 
-// Simple logging to console window
+// Append one line to a log FILE, opening and closing it per line so the write is
+// flushed to disk before whatever comes next gets a chance to crash the machine.
+// The console window dies with a reset; this survives it.
+static void logToFile(struct devbase* db, const char *message) {
+	BPTR fh = Open("SYS:scsidayna.log", MODE_READWRITE);
+	if (!fh) return;
+	Seek(fh, 0, OFFSET_END);
+	FPuts(fh, message);
+	FPuts(fh, "\n");
+	Close(fh);
+}
+
+// Simple logging to console window (and, when debugging, to disk)
 void logMessage(struct devbase* db, const char *message) {
 	struct ScsiDaynaSettings* settings = (struct ScsiDaynaSettings*)db->db_scsiSettings;
+	if (!settings) return;      // can be NULL on an expunge after a failed init
 	if (!settings->debug) return;
 	if (!db->db_debugConsole) db->db_debugConsole = Open("CON:10/10/620/100/SCSIDayna Debug Output (RobSmithDev)/AUTO/CLOSE/WAIT", MODE_NEWFILE);
     if (db->db_debugConsole) {
 		FPuts(db->db_debugConsole, message);
 		FPuts(db->db_debugConsole, "\n");
 	}
+	logToFile(db, message);
 }
 
 // Formatted logging to console window
@@ -96,7 +112,8 @@ static const UWORD stuffChar[] = {0x16c0, 0x4e75};
 void logMessagef(struct devbase* db, const char *messageFormat, ...) {
 	struct ScsiDaynaSettings* settings = (struct ScsiDaynaSettings*)db->db_scsiSettings;
 	if (!settings->debug) return;
-	char buf[100];
+	// Must be large enough for any format string plus a full-length deviceName (107 chars) or SSID
+	char buf[256];
     va_list args;
     va_start(args, messageFormat);	 
     RawDoFmt((STRPTR)messageFormat, (APTR)args, (void (*)(void))stuffChar, buf);
@@ -116,7 +133,8 @@ __saveds struct Device *DevInit( ASMR(d0) DEVBASEP ASMREG(d0), ASMR(a0) BPTR seg
 	db->db_quit = FALSE;
 	db->db_debugConsole = 0;
 	db->db_amigaNetMode = 0;
-  
+	db->db_currentWifiState = 0;
+
 	DOSBase = OpenLibrary("dos.library", 36);
 	if (!DOSBase) {
 		D(("scsidayna: Failed to open dos.library (36)\n"));
@@ -154,7 +172,7 @@ __saveds struct Device *DevInit( ASMR(d0) DEVBASEP ASMREG(d0), ASMR(a0) BPTR seg
 		if (settings->autoConnect) {
 			logMessagef(db, "	Auto Connect Wifi: Yes");
 			logMessagef(db, "	SSID: %s", settings->ssid);
-			logMessagef(db, "	Key: %s", settings->key);
+			logMessagef(db, "	Key: %s", settings->key[0] ? "(set, not shown)" : "(none)");
 		} else {
 			logMessagef(db, "	Auto Connect Wifi: No");
 		}
@@ -180,14 +198,21 @@ __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) UL
 	struct ScsiDaynaSettings* settings = (struct ScsiDaynaSettings*)db->db_scsiSettings;
 	db->db_decrementCountOnFail = 0;		
 			
-    // promiscuous mode not supported
-	if ((flags & SANA2OPF_PROM) && (unit)) {
-		logMessagef(db, "DevOpen: SANA2OPF_PROM not supported on unit id %ld", unit);
+	// Only unit 0 exists - opening any other unit would skip all the one-time
+	// initialisation below and leave the request lists unusable
+	if (unit != 0) {
+		logMessagef(db, "DevOpen: Unit %ld not supported", unit);
 		return returnError(db, ioreq, IOERR_OPENFAIL);
-	}	
+	}
+
+    // promiscuous mode not supported
+	if (flags & SANA2OPF_PROM) {
+		logMessage(db, "DevOpen: SANA2OPF_PROM not supported");
+		return returnError(db, ioreq, IOERR_OPENFAIL);
+	}
 
 	if (strlen(settings->deviceName)<1) {
-		logMessage(db, "DevOpen: CSI device name not set");
+		logMessage(db, "DevOpen: SCSI device name not set");
 		return returnError(db, ioreq, IOERR_OPENFAIL);
 	}
 		
@@ -250,6 +275,10 @@ __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) UL
 			D(("scsidayna: MAC Address stored, checking WIFI status"));
 			logMessagef(db, "DevOpen: Max Data Transfer Size: %ld  (limited to %ld), Max Packets: %ld",db->db_maxPacketsSize, settings->maxDataSize, db->db_maxPackets);
 			if (db->db_maxPacketsSize > settings->maxDataSize) db->db_maxPacketsSize = settings->maxDataSize;
+			// Never allow less than one full-size packet plus batch headers - a value of 0
+			// (bad config or firmware) would underflow the batch buffer arithmetic
+			if (db->db_maxPacketsSize < SCSIWIFI_PACKET_MAX_SIZE + 8) db->db_maxPacketsSize = SCSIWIFI_PACKET_MAX_SIZE + 8;
+			if (db->db_maxPackets < 1) db->db_maxPackets = 1;
 			// Ensure db->db_maxPacketsSize is even
 			if (db->db_maxPacketsSize&1) db->db_maxPacketsSize++;
 		} else {
@@ -298,11 +327,13 @@ __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) UL
 
 		InitSemaphore(&db->db_ProcSem);
 		db->db_online = 1;
+		db->db_currentWifiState = 0;   // the server process will bring this up
 
 		struct ProcInit init;
 		struct MsgPort *port;
 
 		if (port = CreateMsgPort()) {
+			BOOL procFailed = TRUE;
 			D(("scsidayna: Starting Server"));
 			db->db_quit = FALSE;
 			if (db->db_Proc = CreateNewProcTags(NP_Entry, frame_proc, NP_Name, frame_proc_name, NP_Priority, 0, TAG_DONE)) {
@@ -314,18 +345,18 @@ __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) UL
 				D(("scsidayna: handover db: %lx",init.db));
 				PutMsg(&db->db_Proc->pr_MsgPort, (struct Message*)&init);
 				WaitPort(port);
+				GetMsg(port);
 
-				if (init.error) {
-					logMessagef(db,"DevOpen: Process startup error"); 
-					return returnError(db, ioreq, IOERR_OPENFAIL);
-				}
-			} else {
-				logMessagef(db,"DevOpen: Couldn't create process"); 
-				return returnError(db, ioreq, IOERR_OPENFAIL);
+				procFailed = init.error ? TRUE : FALSE;
+				if (procFailed) db->db_Proc = NULL;  // the process has already exited
 			}
 			DeleteMsgPort(port);
+			if (procFailed) {
+				logMessagef(db,"DevOpen: Process startup error");
+				return returnError(db, ioreq, IOERR_OPENFAIL);
+			}
 		} else {
-			logMessagef(db,"DevOpen: Failed to create message port"); 
+			logMessagef(db,"DevOpen: Failed to create message port");
 			return returnError(db, ioreq, IOERR_OPENFAIL);
 		}
 	}
@@ -356,29 +387,87 @@ __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) UL
 	return 0;
 }
 
+// Pull every request belonging to one opener off a queue and return it.
+// Scans from the head each pass: DevTermIO -> ReplyMsg relinks the node into the
+// caller's reply port, so a terminated node can't be used to find the next one.
+static void flushOpenerList(DEVBASEP, struct List* list, struct SignalSemaphore* sem, void* bm) {
+	for (;;) {
+		struct IOSana2Req* found = NULL;
+		struct Node* node;
+
+		ObtainSemaphore(sem);
+		for (node = list->lh_Head; node->ln_Succ; node = node->ln_Succ) {
+			if (((struct IOSana2Req*)node)->ios2_BufferManagement == bm) {
+				Remove(node);
+				found = (struct IOSana2Req*)node;
+				break;
+			}
+		}
+		ReleaseSemaphore(sem);
+
+		if (!found) break;
+		found->ios2_Req.io_Error = IOERR_ABORTED;
+		found->ios2_WireError = S2WERR_UNIT_OFFLINE;
+		DevTermIO(db, (struct IORequest*)found);
+	}
+}
+
+static void flushOpenerRequests(DEVBASEP, void* bm) {
+	flushOpenerList(db, (struct List*)&db->db_ReadList,       &db->db_ReadListSem,       bm);
+	flushOpenerList(db, (struct List*)&db->db_WriteList,      &db->db_WriteListSem,      bm);
+	flushOpenerList(db, (struct List*)&db->db_ReadOrphanList, &db->db_ReadOrphanListSem, bm);
+	flushOpenerList(db, (struct List*)&db->db_EventList,      &db->db_EventListSem,      bm);
+}
+
 __saveds BPTR DevClose( ASMR(a1) struct IORequest *ioreq ASMREG(a1), ASMR(a6) DEVBASEP ASMREG(a6) ) {
 	BPTR  ret = (0);
 
 	D(("scsidayna: DevClose open count %ld\n",db->db_Lib.lib_OpenCnt));
+	logMessagef(db,"DevClose: enter, open count %ld", (LONG)db->db_Lib.lib_OpenCnt);
 	if (!ioreq) return ret;
+
+	// Free the BufferManagement we allocated for this opener in DevOpen.
+	// Anything this opener left queued still points AT that block, and the packet
+	// server task calls through it (bm_CopyToBuffer/bm_CopyFromBuffer) for every
+	// packet it delivers - the task is still running at this point, and is only
+	// told to stop further down. Freeing first left it dereferencing freed memory
+	// and calling a stale function pointer: the crash when Roadshow (Roadie) tears
+	// the interface down. Return the requests first, THEN free.
+	{
+		struct IOSana2Req* ios2 = (struct IOSana2Req*)ioreq;
+		if (ios2->ios2_BufferManagement) {
+			flushOpenerRequests(db, ios2->ios2_BufferManagement);
+			logMessage(db,"DevClose: opener requests flushed");
+			FreeVec(ios2->ios2_BufferManagement);
+			ios2->ios2_BufferManagement = NULL;
+			logMessage(db,"DevClose: buffer management freed");
+		}
+	}
 	db->db_Lib.lib_OpenCnt--;
 
 	if (db->db_Lib.lib_OpenCnt == 0) {
 		if (db->db_Proc) {
 			D(("scsidayna: End Proc...\n"));
+			logMessage(db,"DevClose: signalling packet task to stop");
 			Signal((struct Task*)db->db_Proc, SIGBREAKF_CTRL_C);
-			db->db_quit = TRUE ; // Alternative closure control if signals are not processing 
+			db->db_quit = TRUE ; // Alternative closure control if signals are not processing
 
 			// Wait for shutdown
 			ObtainSemaphore(&db->db_ProcSem);
 			ReleaseSemaphore(&db->db_ProcSem);
 			db->db_Proc = 0;
-		}   
+			logMessage(db,"DevClose: packet task stopped");
+		}
 	}
-	
+
 	ioreq->io_Device = (0);
 	ioreq->io_Unit   = (struct Unit *)(-1);
-	if (db->db_Lib.lib_Flags & LIBF_DELEXP) ret = DevExpunge(db);
+	if (db->db_Lib.lib_Flags & LIBF_DELEXP) {
+		logMessage(db,"DevClose: delayed expunge pending, expunging now");
+		ret = DevExpunge(db);
+	} else {
+		logMessage(db,"DevClose: done (no expunge)");
+	}
 
 	return ret;
 }
@@ -386,12 +475,16 @@ __saveds BPTR DevClose( ASMR(a1) struct IORequest *ioreq ASMREG(a1), ASMR(a6) DE
 __saveds BPTR DevExpunge( ASMR(a6) DEVBASEP ASMREG(a6) ) {
 	BPTR seglist = db->db_SegList;
 
+	logMessagef(db,"DevExpunge: enter, open count %ld", (LONG)db->db_Lib.lib_OpenCnt);
 	if( db->db_Lib.lib_OpenCnt ) {
 		db->db_Lib.lib_Flags |= LIBF_DELEXP;
+		logMessage(db,"DevExpunge: still open, deferred");
 		return 0;
 	}
 
 	D(("scsidayna: Remove Device Node...\n"));
+	// Last chance to log: freeInit() closes DOSBase and frees the settings
+	logMessage(db,"DevExpunge: removing node and freeing base (last log line)");
 	Remove((struct Node*)db);
 
 	freeInit(db);
@@ -459,7 +552,12 @@ __saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6)
 
 	case S2_GETGLOBALSTATS:
 		D(("GETGLOBALSTATS"));
-		memcpy(ioreq->ios2_StatData, &db->db_DevStats, sizeof(struct Sana2DeviceStats));
+		if (ioreq->ios2_StatData) {
+			memcpy(ioreq->ios2_StatData, &db->db_DevStats, sizeof(struct Sana2DeviceStats));
+		} else {
+			ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
+			ioreq->ios2_WireError = S2WERR_NULL_POINTER;
+		}
 		break;
 
 	case S2_BROADCAST:   
@@ -498,8 +596,9 @@ __saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6)
          ((ioreq->ios2_WireError & S2EVENT_OFFLINE) && (!db->db_currentWifiState))) {
            ioreq->ios2_Req.io_Error = 0;
            ioreq->ios2_WireError &= (S2EVENT_ONLINE|S2EVENT_OFFLINE);
-		   ioreq->ios2_Req.io_Flags |= SANA2IOF_QUICK;
-		   D(("S2_ONEVENT: reply quick, wireerror 0x%04X", ioreq->ios2_WireError));
+		   // Complete immediately - DevTermIO honours the caller's own QUICK flag.
+		   // (Never force SANA2IOF_QUICK on: a SendIO'd request would lose its reply.)
+		   D(("S2_ONEVENT: reply now, wireerror 0x%04X", ioreq->ios2_WireError));
            DevTermIO(db, (struct IORequest*)ioreq);
            ioreq = NULL;
       } else{
@@ -538,14 +637,31 @@ __saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6)
 		break;      
 
 	case S2_ONLINE:
+		// The packet server task raises S2EVENT_ONLINE once the hardware is
+		// actually up - don't claim it here, the wifi may not associate.
 		db->db_online = 1;
 		break;
 
 	case S2_OFFLINE:
+		// SANA-II requires S2_OFFLINE to terminate every pending request
+		// BEFORE it returns: the caller (Roadshow, driven by Roadie) is free
+		// to CloseDevice and free its buffer-management callbacks the moment
+		// this reply lands. Just flagging db_online and leaving the flush to
+		// the packet server task left reads/writes queued in the driver for
+		// up to a loop iteration - they were then completed into freed memory.
 		db->db_online = 0;
+		// Refuse new reads/writes from this instant too (CMD_READ, CMD_WRITE
+		// and S2_READORPHAN all gate on this). The task still owns the real
+		// hardware toggle and will switch the DaynaPORT off on its next pass;
+		// it drives that off its own local copy, so this cannot desync it.
+		db->db_currentWifiState = 0;
+		rejectAllPackets(db);
+		DoEvent(db, S2EVENT_OFFLINE);
 		break;
 
-	case S2_CONFIGINTERFACE:   
+	case S2_CONFIGINTERFACE:
+		// Report the (fixed) station address back to the stack
+		memcpy(ioreq->ios2_SrcAddr, HW_MAC, HW_ADDRFIELDSIZE);
 		break;
 
 	case S2_GETSTATIONADDRESS:
@@ -616,25 +732,48 @@ void DoEvent(DEVBASEP, long event) {
 	for(ior = (struct IOSana2Req *) db->db_EventList.lh_Head; (ior2 = (struct IOSana2Req *) ior->ios2_Req.io_Message.mn_Node.ln_Succ) != NULL; ior = ior2 ) {
 		if (ior->ios2_WireError & event) {
 			Remove((struct Node*)ior);
+			// Report only the event(s) that actually fired, not the caller's
+			// whole requested mask (SANA-II: ios2_WireError = events occurred)
+			ior->ios2_WireError &= event;
 			DevTermIO(db, (struct IORequest *)ior);
 		}
 	}
 	ReleaseSemaphore(&db->db_EventListSem );
 }
 
+// Remove ioreq from the given list if (and only if) it is actually queued there.
+// The list semaphore is held so we can't race the packet server process.
+static BOOL abortFromList(DEVBASEP, struct List* list, struct SignalSemaphore* sem, struct IORequest* ioreq) {
+	struct Node* node;
+	BOOL found = FALSE;
+	ObtainSemaphore(sem);
+	for (node = list->lh_Head; node->ln_Succ; node = node->ln_Succ) {
+		if (node == (struct Node*)ioreq) {
+			Remove(node);
+			found = TRUE;
+			break;
+		}
+	}
+	ReleaseSemaphore(sem);
+	return found;
+}
+
 __saveds LONG DevAbortIO( ASMR(a1) struct IORequest *ioreq ASMREG(a1), ASMR(a6) DEVBASEP ASMREG(a6) ) {
-	LONG   ret = 0;
 	struct IOSana2Req* ios2 = (struct IOSana2Req*)ioreq;
 
 	D(("scsidayna: AbortIO on %lx\n",(ULONG)ioreq));
 
-	Remove((struct Node*)ioreq);
-
-	ioreq->io_Error = IOERR_ABORTED;
-	ios2->ios2_WireError = 0;
-
-	ReplyMsg((struct Message*)ioreq);
-	return ret;
+	// Only abort requests we still have queued; a request that already completed
+	// (or was never queued) must not be Remove'd or replied a second time
+	if (abortFromList(db, &db->db_ReadList,       &db->db_ReadListSem,       ioreq) ||
+	    abortFromList(db, &db->db_WriteList,      &db->db_WriteListSem,      ioreq) ||
+	    abortFromList(db, &db->db_EventList,      &db->db_EventListSem,      ioreq) ||
+	    abortFromList(db, &db->db_ReadOrphanList, &db->db_ReadOrphanListSem, ioreq)) {
+		ioreq->io_Error = IOERR_ABORTED;
+		ios2->ios2_WireError = 0;
+		ReplyMsg((struct Message*)ioreq);
+	}
+	return 0;
 }
 
 void DevTermIO( DEVBASEP, struct IORequest *ioreq ) {
@@ -649,7 +788,7 @@ void DevTermIO( DEVBASEP, struct IORequest *ioreq ) {
 
 
 ULONG write_frame(struct IOSana2Req *req, UBYTE* frame, SCSIWIFIDevice scsiDevice, DEVBASEP) {
-   USHORT sz=0;
+   ULONG sz=0;   // ULONG so an oversized ios2_DataLength can't truncate past the MTU check
    UBYTE* inputFrame = frame;
 
 	// Calculate packet size
@@ -657,7 +796,9 @@ ULONG write_frame(struct IOSana2Req *req, UBYTE* frame, SCSIWIFIDevice scsiDevic
       sz = req->ios2_DataLength;
    } else {
       sz = req->ios2_DataLength + HW_ETH_HDR_SIZE;
-      *((USHORT*)(frame+6+6)) = (USHORT)req->ios2_PacketType;
+      // Byte writes: keeps this safe even if the buffer were ever oddly aligned (68000)
+      frame[12] = (UBYTE)(req->ios2_PacketType >> 8);
+      frame[13] = (UBYTE)(req->ios2_PacketType & 0xFF);
       memcpy(frame, req->ios2_DstAddr, HW_ADDRFIELDSIZE);
       memcpy(frame+6, HW_MAC, HW_ADDRFIELDSIZE);
       frame+=HW_ETH_HDR_SIZE;
@@ -691,7 +832,7 @@ ULONG write_frame(struct IOSana2Req *req, UBYTE* frame, SCSIWIFIDevice scsiDevic
 	}
 	
 	// Send it
-	if (SCSIWifi_sendFrame(scsiDevice, inputFrame, sz)) {
+	if (SCSIWifi_sendFrame(scsiDevice, inputFrame, (UWORD)sz)) {
 		req->ios2_Req.io_Error = req->ios2_WireError = 0;
 		db->db_DevStats.PacketsSent++;
 		return 1;
@@ -712,7 +853,16 @@ ULONG read_frame(DEVBASEP, struct IOSana2Req *req, UBYTE *frm, USHORT packetSize
 
 	// This length includes 4 bytes for the CRC at the end, but we dont need that
 	ULONG sz   = ((ULONG)frm[0]<<8)|((ULONG)frm[1]);
-	if (sz<4) return 1;
+	// Sanity check: must contain at least an Ethernet header plus the CRC, and must
+	// not claim more data than was actually transferred (guards against runts and
+	// a corrupt length underflowing "sz - HW_ETH_HDR_SIZE" below)
+	if ((sz < HW_ETH_HDR_SIZE + 4) || (sz + 6 > (ULONG)packetSize)) {
+		req->ios2_Req.io_Error = S2ERR_SOFTWARE;
+		req->ios2_WireError = S2WERR_GENERIC_ERROR;
+		req->ios2_DataLength = 0;
+		DoEvent(db, S2EVENT_ERROR | S2EVENT_RX);
+		return 0;
+	}
 	sz -= 4;
 
 	req->ios2_PacketType = ((USHORT)frm[12+6]<<8)|((USHORT)frm[13+6]);
@@ -801,37 +951,32 @@ ULONG receivePacket(DEVBASEP, UBYTE* packet, USHORT packetSize, struct IOSana2Re
 }
 
 
-void rejectAllPackets(DEVBASEP) {
-  struct IOSana2Req *ior;
+// Return every request queued on one list to its owner with "unit offline".
+// Always take the head afresh: DevTermIO -> ReplyMsg relinks the node into the
+// caller's reply port, which overwrites ln_Succ, so a node can NOT be used to
+// walk to the next one after it has been terminated.
+static void flushListOffline(DEVBASEP, struct List* list, struct SignalSemaphore* sem) {
+   struct IOSana2Req *ior;
 
+   for (;;) {
+      ObtainSemaphore(sem);
+      ior = (struct IOSana2Req *)RemHead(list);
+      ReleaseSemaphore(sem);
+      if (!ior) break;
+
+      ior->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
+      ior->ios2_WireError = S2WERR_UNIT_OFFLINE;
+      // Terminated outside the semaphore - nothing else may touch the node now
+      DevTermIO(db, (struct IORequest*)ior);
+   }
+}
+
+void rejectAllPackets(DEVBASEP) {
   D(("Reject all Packets\n"));
 
-   ObtainSemaphore(&db->db_WriteListSem);
-   for (ior = (struct IOSana2Req *)db->db_WriteList.lh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ; ior = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) {      
-      ior->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
-      ior->ios2_WireError = S2WERR_UNIT_OFFLINE;
-      Remove((struct Node*)ior);
-      DevTermIO(db, (struct IORequest*)ior);
-   }
-   ReleaseSemaphore(&db->db_WriteListSem);
-
-   ObtainSemaphore(&db->db_ReadListSem);
-   for (ior = (struct IOSana2Req *)db->db_ReadList.lh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ; ior = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) {
-      ior->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
-      ior->ios2_WireError = S2WERR_UNIT_OFFLINE;
-      Remove((struct Node*)ior);
-      DevTermIO(db, (struct IORequest*)ior);
-   }
-   ReleaseSemaphore(&db->db_ReadListSem);
-
-   ObtainSemaphore(&db->db_ReadOrphanListSem);
-   for (ior = (struct IOSana2Req *)db->db_ReadOrphanList.lh_Head; ior->ios2_Req.io_Message.mn_Node.ln_Succ; ior = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) {
-      ior->ios2_Req.io_Error = S2ERR_OUTOFSERVICE;
-      ior->ios2_WireError = S2WERR_UNIT_OFFLINE;
-      Remove((struct Node*)ior);
-      DevTermIO(db, (struct IORequest*)ior);
-   }
-   ReleaseSemaphore(&db->db_ReadOrphanListSem);   
+   flushListOffline(db, (struct List*)&db->db_WriteList,      &db->db_WriteListSem);
+   flushListOffline(db, (struct List*)&db->db_ReadList,       &db->db_ReadListSem);
+   flushListOffline(db, (struct List*)&db->db_ReadOrphanList, &db->db_ReadOrphanListSem);
 
    D(("Reject all Packets done\n"));
 }
@@ -866,9 +1011,12 @@ __saveds void frame_proc() {
 	}
 
 	struct MsgPort timerPort;
-	timerPort.mp_Node.ln_Pri = 0;                       
-	timerPort.mp_SigBit      = AllocSignal(-1);
-	timerPort.mp_SigTask     = (struct Task *)FindTask(0);
+	timerPort.mp_Node.ln_Pri  = 0;
+	timerPort.mp_Node.ln_Type = NT_MSGPORT;
+	timerPort.mp_Node.ln_Name = NULL;
+	timerPort.mp_Flags        = PA_SIGNAL;   // was uninitialised stack garbage!
+	timerPort.mp_SigBit       = AllocSignal(-1);
+	timerPort.mp_SigTask      = (struct Task *)FindTask(0);
 	NewList(&timerPort.mp_MsgList);
 
 	LONG errorDevOpen = 0;
@@ -895,7 +1043,7 @@ __saveds void frame_proc() {
 	logMessagef(db,"PacketServer: Starting Wifi Device"); 
 	scsiDevice = SCSIWifi_open(&openData, &scsiResult);
 
-	if ((!packetData) || (errorDevOpen !=0) || (((char)timerPort.mp_SigBit) < 0) || (!time_req) | (!scsiDevice)) {
+	if ((!packetData) || (errorDevOpen !=0) || (((char)timerPort.mp_SigBit) < 0) || (!time_req) || (!scsiDevice)) {
 		init->error = 1;
 		DoEvent(db, S2EVENT_OFFLINE);
 		db->db_online = 0;
@@ -914,23 +1062,24 @@ __saveds void frame_proc() {
 		}
 		
 		if (errorDevOpen != 0) {
-			logMessage(db,"PacketServer: Out of memory [3]");
-			D(("scsidayna_task: Out of memory [3]\n")); 
-		} else {			
-			CloseDevice((struct IORequest *)time_req);
-			if (!time_req) {
-				logMessage(db,"PacketServer: Out of memory [2]");
-				D(("scsidayna_task: Out of memory [2]\n")); 			
-			} else {
-				DeleteIORequest((struct IORequest *)time_req);
-			}
+			logMessage(db,"PacketServer: Failed to open timer.device");
+			D(("scsidayna_task: timer.device open failed\n"));
 		}
-		
+		if (time_req) {
+			// Only close the device if it was successfully opened
+			if (errorDevOpen == 0) CloseDevice((struct IORequest *)time_req);
+			DeleteIORequest((struct IORequest *)time_req);
+		} else {
+			logMessage(db,"PacketServer: Out of memory [2]");
+			D(("scsidayna_task: Out of memory [2]\n"));
+		}
+
 		if (!packetData) {
 			logMessage(db,"PacketServer: Out of memory [1]");
-			D(("scsidayna_task: Out of memory [1]\n")); 
+			D(("scsidayna_task: Out of memory [1]\n"));
 		} else FreeVec(packetData);
-				
+		if (pendingSends) FreeVec(pendingSends);
+
 		if (((char)timerPort.mp_SigBit)>=0) FreeSignal(timerPort.mp_SigBit);
 		ReplyMsg((struct Message*)init);
 		Forbid();
@@ -968,8 +1117,14 @@ __saveds void frame_proc() {
 		USHORT shouldBeEnabled = db->db_online;
 
 		GetSysTime(&timeWifiCheck);
-		// Every 5 seconds check WIFI status
-		if (abs(timeWifiCheck.tv_secs-timeLastWifiCheck.tv_secs)>=5) {
+		// Every 5 seconds check WIFI status - but ONLY while the radio is
+		// actually enabled. A disabled DaynaPORT reports rssi 0 by definition,
+		// so polling it while offline just latched lastWifiStatus=0, which then
+		// vetoed shouldBeEnabled below and made S2_ONLINE impossible to honour:
+		// once taken offline the interface could never be brought back up.
+		// Skipping it also keeps pointless SCSI traffic off a shared bus (on the
+		// A500 the boot drive is on the same bus as the DaynaPORT).
+		if (currentWifiState && (abs(timeWifiCheck.tv_secs-timeLastWifiCheck.tv_secs)>=5)) {
 			D(("scsidayna_task: Check WIFI Status\n"));
 			struct SCSIWifi_NetworkEntry wifi;
 			if (SCSIWifi_getNetwork(scsiDevice, &wifi)) {
@@ -985,7 +1140,9 @@ __saveds void frame_proc() {
 			}
 			timeLastWifiCheck.tv_secs = timeWifiCheck.tv_secs;
 		}
-		if (!lastWifiStatus) shouldBeEnabled = 0;
+		// A bad wifi reading only takes us DOWN while we are actually up - it must
+		// never veto a pending online request (see above).
+		if (currentWifiState && !lastWifiStatus) shouldBeEnabled = 0;
 
 		// Handle state toggle - also goes offline if theres no connections
 		if (currentWifiState != shouldBeEnabled) {
@@ -993,7 +1150,13 @@ __saveds void frame_proc() {
 			currentWifiState = shouldBeEnabled;
 			SCSIWifi_enable(scsiDevice, shouldBeEnabled); 
 			if (!shouldBeEnabled) rejectAllPackets(db);
-			if (shouldBeEnabled) GetSysTime(&db->db_DevStats.LastStart);
+			if (shouldBeEnabled) {
+				GetSysTime(&db->db_DevStats.LastStart);
+				// Radio has just been re-enabled: assume good and restart the
+				// poll clock, so it re-associates before we judge the signal.
+				lastWifiStatus = 1;
+				timeLastWifiCheck.tv_secs = timeWifiCheck.tv_secs;
+			}
 			DoEvent(db, shouldBeEnabled ? S2EVENT_ONLINE : S2EVENT_OFFLINE);
 			db->db_currentWifiState = currentWifiState;
 		}
@@ -1159,7 +1322,22 @@ __saveds void frame_proc() {
 				ObtainSemaphore(&db->db_WriteListSem);
 				struct IOSana2Req *ior = (struct IOSana2Req *)db->db_WriteList.lh_Head;
 			    while ((nextwrite = (struct IOSana2Req *)ior->ios2_Req.io_Message.mn_Node.ln_Succ) != NULL) {
-					USHORT sz = ior->ios2_DataLength;					
+					ULONG szl = ior->ios2_DataLength;
+
+					// Reject packets that could never fit in any batch - they would sit
+					// at the head of the queue forever, jamming all traffic behind them
+					const ULONG wireSize = (ior->ios2_Req.io_Flags & SANA2IOF_RAW) ? szl : szl + HW_ETH_HDR_SIZE;
+					if ((wireSize < 1) || (wireSize > SCSIWIFI_PACKET_MAX_SIZE)) {
+						ior->ios2_Req.io_Error = S2ERR_MTU_EXCEEDED;
+						ior->ios2_WireError = S2WERR_BUFF_ERROR;
+						Remove((struct Node*)ior);
+						DevTermIO(db, (struct IORequest *)ior);
+						DoEvent(db, S2EVENT_ERROR | S2EVENT_BUFF | S2EVENT_SOFTWARE);
+						D(("Batch: rejected invalid-size packet"));
+						ior = nextwrite;
+						continue;
+					}
+					USHORT sz = (USHORT)szl;					
 					UBYTE* rewind = dataOut;
 					const USHORT rewindSize = spaceRemaining;
 
@@ -1179,7 +1357,10 @@ __saveds void frame_proc() {
 						dataOut+=2;
 						spaceRemaining -= 2;
 
-						*((USHORT*)(dataOut+12)) = (USHORT)ior->ios2_PacketType;
+						// Byte-wise: dataOut can be odd here after an odd-length packet, and a
+						// word write to an odd address is an address-error crash on a 68000
+						dataOut[12] = (UBYTE)(ior->ios2_PacketType >> 8);
+						dataOut[13] = (UBYTE)(ior->ios2_PacketType & 0xFF);
 						// Add ethernet header
 						memcpy(dataOut, ior->ios2_DstAddr, HW_ADDRFIELDSIZE);
 						memcpy(dataOut+6, HW_MAC, HW_ADDRFIELDSIZE);
@@ -1308,7 +1489,8 @@ __saveds void frame_proc() {
 	D(("scsidayna_task: i/o shutdown\n"));
 	logMessage(db,"PacketServer: Shutting down [2]");
 
-	SCSIWifi_enable(scsiDevice, 0); 
+	db->db_currentWifiState = 0;   // stop DevBeginIO accepting new requests
+	SCSIWifi_enable(scsiDevice, 0);
 	DoEvent(db, S2EVENT_OFFLINE);
 	rejectAllPackets(db);
 	FreeVec(packetData);
