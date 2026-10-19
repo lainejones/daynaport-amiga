@@ -326,6 +326,8 @@ __saveds LONG DevOpen( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(d0) UL
 		NewList(&db->db_ReadOrphanList); 	InitSemaphore(&db->db_ReadOrphanListSem);
 
 		InitSemaphore(&db->db_ProcSem);
+		InitSemaphore(&db->db_mcastSem);
+		db->db_mcastCount = db->db_mcastSent = 0;
 		db->db_online = 1;
 		db->db_currentWifiState = 0;   // the server process will bring this up
 
@@ -560,6 +562,14 @@ __saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6)
 		}
 		break;
 
+	case S2_MULTICAST:      /* a write to a group address (mDNS): the caller set DstAddr */
+		if (!(ioreq->ios2_DstAddr[0] & 1)) {
+			ioreq->ios2_Req.io_Error = S2ERR_BAD_ADDRESS;
+			ioreq->ios2_WireError = S2WERR_BAD_MULTICAST;
+			break;
+		}
+		goto do_write;
+
 	case S2_BROADCAST:   
 		if (ioreq->ios2_DstAddr) {
 			memset(ioreq->ios2_DstAddr, 0xFF, HW_ADDRFIELDSIZE);
@@ -570,6 +580,7 @@ __saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6)
 		}
 		// fall through!	
 	case CMD_WRITE: 
+	do_write:
 		D(("W"));
 		if (ioreq->ios2_BufferManagement == NULL) {
 			ioreq->ios2_Req.io_Error = S2ERR_BAD_ARGUMENT;
@@ -682,6 +693,39 @@ __saveds VOID DevBeginIO( ASMR(a1) struct IOSana2Req *ioreq ASMREG(a1), ASMR(a6)
 			devquery->SizeSupplied = (devquery->SizeAvailable<34?devquery->SizeAvailable:34);
 		}
 		break;
+	case S2_ADDMULTICASTADDRESS:
+		if (!(ioreq->ios2_SrcAddr[0] & 1)) {
+			ioreq->ios2_Req.io_Error = S2ERR_BAD_ADDRESS;     /* not a group address */
+			ioreq->ios2_WireError = S2WERR_BAD_MULTICAST;
+		} else {
+			USHORT i, k;
+			ObtainSemaphore(&db->db_mcastSem);
+			for (i = 0; i < db->db_mcastCount; i++) {
+				for (k = 0; k < 6 && db->db_mcast[i][k] == ioreq->ios2_SrcAddr[k]; k++) ;
+				if (k == 6) break;              /* already in the table */
+			}
+			if (i == db->db_mcastCount) {
+				if (db->db_mcastCount < 8) {
+					memcpy(db->db_mcast[db->db_mcastCount], ioreq->ios2_SrcAddr, 6);
+					db->db_mcastCount++;
+				} else {
+					ioreq->ios2_Req.io_Error = S2ERR_NO_RESOURCES;
+					ioreq->ios2_WireError = S2WERR_MULTICAST_FULL;
+				}
+			}
+			ReleaseSemaphore(&db->db_mcastSem);
+			/* Not sent to the adapter: the DaynaPORT's "add multicast" (SCSI 0x0D)
+			 * made a BlueSCSI answer with a status gvpscsi.device stops the
+			 * machine for (Unexpected Status $48/$46). The table is kept so the
+			 * stack's add/delete pairs stay consistent. */
+		}
+		break;
+
+	case S2_DELMULTICASTADDRESS:
+		/* The DaynaPORT protocol has no "remove": the adapter keeps passing the
+		 * group up, which costs a few frames and nothing else. Accept it. */
+		break;
+
 	case S2_GETSPECIALSTATS:
 		{
 		  struct Sana2SpecialStatHeader *s2ssh = (struct Sana2SpecialStatHeader *)ioreq->ios2_StatData;

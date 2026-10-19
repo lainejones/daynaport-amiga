@@ -62,6 +62,13 @@ struct devbase {
 	struct SignalSemaphore db_ReadOrphanListSem;
 	struct Process* db_Proc;
 	struct SignalSemaphore db_ProcSem;
+	/* Multicast groups (S2_ADDMULTICASTADDRESS). The DaynaPORT takes them over
+	 * SCSI (command 0x0D), which only the packet server process may do: the
+	 * caller's BeginIO records the address here and signals it. */
+	UBYTE db_mcast[8][6];
+	volatile USHORT db_mcastCount;          /* addresses in the table */
+	volatile USHORT db_mcastSent;           /* how many the adapter has been given */
+	struct SignalSemaphore db_mcastSem;
 };
 
 #ifndef DEVBASETYPE
