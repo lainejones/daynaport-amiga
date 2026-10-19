@@ -694,7 +694,10 @@ LONG SCSIWifi_getNetwork(SCSIWIFIDevice device, struct SCSIWifi_NetworkEntry* co
 LONG SCSIWifi_addMulticastAddress(SCSIWIFIDevice device, struct SCSIWifi_MACAddress* macAddress) {
     LSCSIDevice dev = (LSCSIDevice)device;
 
-    SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_ADDMULTICAST, 0, 0, 6, 0, 0);
+    /* the transfer length is CDB bytes 3-4, big-endian (BlueSCSI/ZuluSCSI read
+     * (cdb[3] << 8) + cdb[4]): a 6 in byte 3 asked for 1536 bytes, so the
+     * target stayed in DATA OUT and the host adapter reported a bad status */
+    SCSI_PREPCMD(dev, SCSI_NETWORK_WIFI_ADDMULTICAST, 0, 0, 0, 6, 0);
     memcpy(&dev->scsiCommand[6], macAddress->address, 6);     
 
     dev->Cmd.scsi_Data = (APTR)&dev->scsiCommand[6];       
