@@ -91,6 +91,10 @@ struct ScsiDaynaSettings {
   // If debug is enabled - creates a console window and shows the output
   UBYTE debug;
   UBYTE aggressive;
+  // Send multicast groups to the adapter (DaynaPORT SCSI command 0x0D). Off by
+  // default: a BlueSCSI behind a GVP controller answered it with a status
+  // gvpscsi.device stopped the machine for.
+  UBYTE multicast;
 };
 
 #ifdef __VBCC__
