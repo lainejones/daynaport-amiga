@@ -1220,7 +1220,18 @@ __saveds void frame_proc() {
 			DoEvent(db, shouldBeEnabled ? S2EVENT_ONLINE : S2EVENT_OFFLINE);
 			db->db_currentWifiState = currentWifiState;
 		}
-    
+		// Publish the hardware state on every pass, not only on a toggle.
+		// S2_OFFLINE zeroes db_currentWifiState so new requests are refused
+		// at once; a stack that cycles the unit S2_OFFLINE/S2_ONLINE to reset
+		// it (PrismNet does, when a write stalls) sends the S2_ONLINE before
+		// this task ran. Then nothing toggles - the hardware never went off -
+		// and without this the gates stayed shut: every read and write was
+		// refused "out of service" until the device was closed and reopened.
+		if (db->db_currentWifiState != currentWifiState) {
+			db->db_currentWifiState = currentWifiState;
+			if (currentWifiState) DoEvent(db, S2EVENT_ONLINE);
+		}
+
 		if (currentWifiState) {
 			UBYTE morePackets = 0;
 			USHORT counter = 0;   
