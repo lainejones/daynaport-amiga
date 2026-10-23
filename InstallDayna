@@ -13,7 +13,7 @@
 ; Existing config files are NOT overwritten (so re-running is safe on an
 ; already-tuned machine) - it says "kept existing" instead.
 ;
-; Defaults below = one example LAN (a static 192.168.50.36). Edit for your own.
+; Defaults below are one example LAN (a static 192.168.50.36). Edit for your own.
 ; For an interactive walkthrough use the full "Install" script instead.
 ;
 ; Run from the drawer containing scsidayna.device and scsidayna.prefs:

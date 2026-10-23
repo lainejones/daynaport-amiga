@@ -1,6 +1,34 @@
 # Amiga DaynaPORT Driver for BlueSCSI V2 and ZuluSCSI
 Created by RobSmithDev
 
+## About this fork
+
+This is a fork of [RobSmithDev/daynaport-amiga](https://github.com/RobSmithDev/daynaport-amiga)
+(the driver is Rob Smith's; see the credits below). It carries a few fixes and one feature that are
+not in the original yet. Releases of the fork are on this repository's Releases page; the file is
+`scsidayna.device`, copied to `DEVS:Networks/`, with the same `scsidayna.prefs` as the original plus
+one optional key. The fork has been running on an Amiga 500 (GVP A530, BlueSCSI v2) and an Amiga 1200
+(DataFlyer SCSI+, ZuluSCSI) for months; it is built for the 68000 and runs on every CPU.
+
+- **1.8** (2026-10-22): after a TCP/IP stack cycled the unit `S2_OFFLINE` then `S2_ONLINE` to reset it
+  (PrismNet does that when a write stalls), the driver refused every read and write "out of service"
+  until the device was closed and reopened; the network was dead for good. The packet task now
+  republishes its state on every pass and raises `S2EVENT_ONLINE` when the gates reopen that way.
+- **1.7** (2026-10-19): `S2_ADDMULTICASTADDRESS` sent the wrong transfer length to the adapter
+  (asked for 1536 bytes), which some SCSI drivers reported as an "unexpected status" requester.
+  Sent upstream as [pull request 18](https://github.com/RobSmithDev/daynaport-amiga/pull/18).
+- **1.6** (2026-10-19): multicast. `S2_ADDMULTICASTADDRESS` / `S2_DELMULTICASTADDRESS` /
+  `S2_MULTICAST` are implemented and, with `MULTICAST=1` in `scsidayna.prefs`, the groups are given
+  to the adapter, so mDNS names (`amiga.local`) resolve. Without the key the driver behaves as before.
+- **2026-08**: crashes and races on shutdown fixed: `S2_OFFLINE` terminates every pending request
+  before it returns (a stack could free its buffers while requests were still queued), the flush walked
+  a list it was modifying, `AbortIO` searched the wrong lists, `CloseDevice` leaked its port and buffer
+  management, the batch send wrote a word to an odd address (an address error on a 68000), the WiFi
+  key no longer appears in the debug log, and a few more (see the commit history).
+
+Original README follows.
+
+
 This is an implementation of a SANA-II driver for the Amiga, which allows you to use either a PicoW enabled BlueSCSI V2, or various WiFi equipped ZuluSCSI models to give internet access to the machine!
 
 This code was originally based on the MNT ZZ9000Net driver by Lukas F. Hartmann (which is based on work by Henryk Richter) and also borrows a little from the PlipBox device driver, which has several contributors.
@@ -75,6 +103,7 @@ where:
 - KEY the wifi key/password
 - DATASIZE With the new Scsi firmware, you can bulk-transfer packet data upto this amount for increased speed (defaults to 8192, some devices might not support different sizes)
 - DEBUG 0/1 Causes a console window to appear to help debug issues with the driver, disable when sorted or it slows things down
+- MULTICAST 0/1 (fork, 1.6+) Gives the multicast groups a TCP/IP stack asks for to the adapter, so mDNS names resolve. Default 0.
 - AGGRESSIVE 0/1 Enables agressive mode, driver run without 1ms wait - experimental - may scale with processor/priority
 
 ## Mode
