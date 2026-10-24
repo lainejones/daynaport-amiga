@@ -10,6 +10,9 @@ not in the original yet. Releases of the fork are on this repository's Releases 
 one optional key. The fork has been running on an Amiga 500 (GVP A530, BlueSCSI v2) and an Amiga 1200
 (DataFlyer SCSI+, ZuluSCSI) for months; it is built for the 68000 and runs on every CPU.
 
+- **1.9** (2026-10-24): the `daynawifi` Shell tool (below): the adapter's Wi-Fi status, a forced
+  re-join for an adapter that still says "connected" after the router dropped it, and a scan.
+  `InstallDayna` copies it to `C:`. The driver itself is unchanged.
 - **1.8** (2026-10-22): after a TCP/IP stack cycled the unit `S2_OFFLINE` then `S2_ONLINE` to reset it
   (PrismNet does that when a write stalls), the driver refused every read and write "out of service"
   until the device was closed and reopened; the network was dead for good. The packet task now

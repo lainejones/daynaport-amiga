@@ -24,6 +24,11 @@ If NOT EXISTS DEVS:Networks
 EndIf
 Copy scsidayna.device DEVS:Networks/ CLONE QUIET
 Echo "Installed DEVS:Networks/scsidayna.device"
+If EXISTS daynawifi
+  Copy daynawifi C: CLONE QUIET
+  Protect C:daynawifi +e
+  Echo "Installed C:daynawifi (the adapter's Wi-Fi: status, REJOIN, SCAN)"
+EndIf
 
 If EXISTS ENVARC:scsidayna.prefs
   Echo "kept existing ENVARC:scsidayna.prefs"
