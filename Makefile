@@ -43,5 +43,6 @@ DEVICEID2=
 ###############################################################################
 include Common.mk
 
-
-
+# the Shell tool (vbcc, same flags as the device): make daynawifi
+daynawifi: daynawifi.c scsiwifi.c scsiwifi.h
+	vc +aos68k -O2 -+ -sc -cpu=$(CPU) $(IPATH) -I. -o $@ daynawifi.c scsiwifi.c -lamiga

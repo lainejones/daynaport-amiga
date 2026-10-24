@@ -120,3 +120,28 @@ A small note about task priority.
 
 - With the new driver, leave this at zero as it performs better!
 - With the original driver, left at 0 the device will function perfectly fine, however the throughput of data is somewhat all over the place. For stable throughput, then set this to '1', but also expect this will possibly slow down some of the other applications running on your system.
+
+## daynawifi (fork, 1.9+)
+
+A Shell tool for the adapter's Wi-Fi, built from the driver's own `scsiwifi.c`:
+
+```
+daynawifi            what the adapter is joined to and its signal, and its MAC
+daynawifi REJOIN     reset the adapter's packet buffer and join the network again
+daynawifi SCAN       the networks it can see
+```
+
+It reads the adapter, driver and SCSI ID from `ENV:scsidayna.prefs` (`DEVICEID=-1` scans the units as
+the driver does) and the network from its `SSID=` and `KEY=` lines; `SSID=` and `KEY=` on the command
+line override them. Stop the TCP/IP stack before `REJOIN` (the driver polls the adapter while a stack
+is up) and start it again after - from one script, if the stack also carries the connection you are
+working over.
+
+Why: a ZuluSCSI's Wi-Fi can go on reporting "connected" after the router has dropped it (the router's
+band steering re-initialised the station every hour; one night it stayed gone). The driver's
+`AUTOCONNECT=1` then does nothing - it sees "already connected" and sends no join. `daynawifi REJOIN`
+sends the join anyway; on an A1200 the adapter re-associated in 18 s and DHCP came back, where before
+only a power cycle helped.
+
+Build: `vc +aos68k -O2 -+ -sc -cpu=68000 -Indk-fix -I<NDK include> -I. -o daynawifi daynawifi.c scsiwifi.c -lamiga`
+(or `make daynawifi` with the WSL setup in build-wsl.sh).
